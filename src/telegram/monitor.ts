@@ -177,7 +177,23 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
     try {
       // runner.task() returns a promise that resolves when the runner stops
       await runner.task();
-      return;
+      if (opts.abortSignal?.aborted) {
+        return;
+      }
+      restartAttempts += 1;
+      const delayMs = computeBackoff(TELEGRAM_POLL_RESTART_POLICY, restartAttempts);
+      (opts.runtime?.warn ?? console.warn)(
+        `Telegram polling stopped without error; restarting in ${formatDurationMs(delayMs)}.`,
+      );
+      try {
+        await sleepWithAbort(delayMs, opts.abortSignal);
+      } catch (sleepErr) {
+        if (opts.abortSignal?.aborted) {
+          return;
+        }
+        throw sleepErr;
+      }
+      continue;
     } catch (err) {
       if (opts.abortSignal?.aborted) {
         throw err;
@@ -197,6 +213,7 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
       );
       try {
         await sleepWithAbort(delayMs, opts.abortSignal);
+        restartAttempts = 0;
       } catch (sleepErr) {
         if (opts.abortSignal?.aborted) {
           return;

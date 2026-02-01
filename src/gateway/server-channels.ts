@@ -4,7 +4,9 @@ import type { createSubsystemLogger } from "../logging/subsystem.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import { type ChannelId, getChannelPlugin, listChannelPlugins } from "../channels/plugins/index.js";
+import { computeBackoff } from "../infra/backoff.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { formatDurationMs } from "../infra/format-duration.js";
 import { resetDirectoryCache } from "../infra/outbound/target-resolver.js";
 import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
 
@@ -17,6 +19,7 @@ type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 
 type ChannelRuntimeStore = {
   aborts: Map<string, AbortController>;
+  restartCounts: Map<string, number>;
   tasks: Map<string, Promise<unknown>>;
   runtimes: Map<string, ChannelAccountSnapshot>;
 };
@@ -24,6 +27,7 @@ type ChannelRuntimeStore = {
 function createRuntimeStore(): ChannelRuntimeStore {
   return {
     aborts: new Map(),
+    restartCounts: new Map(),
     tasks: new Map(),
     runtimes: new Map(),
   };
@@ -59,6 +63,16 @@ export type ChannelManager = {
   stopChannel: (channel: ChannelId, accountId?: string) => Promise<void>;
   markChannelLoggedOut: (channelId: ChannelId, cleared: boolean, accountId?: string) => void;
 };
+
+const CHANNEL_RESTART_POLICY = {
+  initialMs: 2000,
+  maxMs: 30_000,
+  factor: 1.8,
+  jitter: 0.25,
+};
+
+const CHANNEL_RESTART_RESET_THRESHOLD_MS = 60_000;
+const CHANNEL_RESTART_MAX_ATTEMPTS = 10;
 
 // Channel docking: lifecycle hooks (`plugin.gateway`) flow through this manager.
 export function createChannelManager(opts: ChannelManagerOptions): ChannelManager {
@@ -139,20 +153,22 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
         }
 
         const abort = new AbortController();
+        const startedAt = Date.now();
         store.aborts.set(id, abort);
         setRuntime(channelId, id, {
           accountId: id,
           running: true,
-          lastStartAt: Date.now(),
+          lastStartAt: startedAt,
           lastError: null,
         });
 
         const log = channelLogs[channelId];
+        const runtime = channelRuntimeEnvs[channelId];
         const task = startAccount({
           cfg,
           accountId: id,
           account,
-          runtime: channelRuntimeEnvs[channelId],
+          runtime,
           abortSignal: abort.signal,
           log,
           getStatus: () => getRuntime(channelId, id),
@@ -172,6 +188,28 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
               running: false,
               lastStopAt: Date.now(),
             });
+            const runDurationMs = Date.now() - startedAt;
+            if (runDurationMs >= CHANNEL_RESTART_RESET_THRESHOLD_MS) {
+              store.restartCounts.delete(id);
+            }
+            if (abort.signal.aborted) {
+              return;
+            }
+            const nextAttempt = (store.restartCounts.get(id) ?? 0) + 1;
+            store.restartCounts.set(id, nextAttempt);
+            if (nextAttempt > CHANNEL_RESTART_MAX_ATTEMPTS) {
+              (runtime?.error ?? console.error)(
+                `Channel ${channelId} (${id}) stopped unexpectedly; giving up after ${CHANNEL_RESTART_MAX_ATTEMPTS} restarts.`,
+              );
+              return;
+            }
+            const delayMs = computeBackoff(CHANNEL_RESTART_POLICY, nextAttempt);
+            (runtime?.warn ?? console.warn)(
+              `Channel ${channelId} (${id}) exited unexpectedly; restarting in ${formatDurationMs(delayMs)} (${nextAttempt}/${CHANNEL_RESTART_MAX_ATTEMPTS}).`,
+            );
+            setTimeout(() => {
+              void startChannel(channelId, id);
+            }, delayMs);
           });
         store.tasks.set(id, tracked);
       }),

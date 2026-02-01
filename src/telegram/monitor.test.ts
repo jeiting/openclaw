@@ -102,10 +102,18 @@ describe("monitorTelegramProvider (grammY)", () => {
   });
 
   it("processes a DM and sends reply", async () => {
+    const abort = new AbortController();
     Object.values(api).forEach((fn) => {
       fn?.mockReset?.();
     });
-    await monitorTelegramProvider({ token: "tok" });
+    runSpy.mockImplementationOnce(() => ({
+      task: () =>
+        Promise.resolve().then(() => {
+          abort.abort();
+        }),
+      stop: vi.fn(),
+    }));
+    await monitorTelegramProvider({ token: "tok", abortSignal: abort.signal });
     expect(handlers.message).toBeDefined();
     await handlers.message?.({
       message: {
@@ -122,13 +130,21 @@ describe("monitorTelegramProvider (grammY)", () => {
   });
 
   it("uses agent maxConcurrent for runner concurrency", async () => {
+    const abort = new AbortController();
     runSpy.mockClear();
+    runSpy.mockImplementationOnce(() => ({
+      task: () =>
+        Promise.resolve().then(() => {
+          abort.abort();
+        }),
+      stop: vi.fn(),
+    }));
     loadConfig.mockReturnValue({
       agents: { defaults: { maxConcurrent: 3 } },
       channels: { telegram: {} },
     });
 
-    await monitorTelegramProvider({ token: "tok" });
+    await monitorTelegramProvider({ token: "tok", abortSignal: abort.signal });
 
     expect(runSpy).toHaveBeenCalledWith(
       expect.anything(),
@@ -144,10 +160,18 @@ describe("monitorTelegramProvider (grammY)", () => {
   });
 
   it("requires mention in groups by default", async () => {
+    const abort = new AbortController();
     Object.values(api).forEach((fn) => {
       fn?.mockReset?.();
     });
-    await monitorTelegramProvider({ token: "tok" });
+    runSpy.mockImplementationOnce(() => ({
+      task: () =>
+        Promise.resolve().then(() => {
+          abort.abort();
+        }),
+      stop: vi.fn(),
+    }));
+    await monitorTelegramProvider({ token: "tok", abortSignal: abort.signal });
     await handlers.message?.({
       message: {
         message_id: 2,
@@ -161,6 +185,7 @@ describe("monitorTelegramProvider (grammY)", () => {
   });
 
   it("retries on recoverable network errors", async () => {
+    const abort = new AbortController();
     const networkError = Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
     runSpy
       .mockImplementationOnce(() => ({
@@ -168,15 +193,46 @@ describe("monitorTelegramProvider (grammY)", () => {
         stop: vi.fn(),
       }))
       .mockImplementationOnce(() => ({
-        task: () => Promise.resolve(),
+        task: () =>
+          Promise.resolve().then(() => {
+            abort.abort();
+          }),
         stop: vi.fn(),
       }));
 
-    await monitorTelegramProvider({ token: "tok" });
+    await monitorTelegramProvider({ token: "tok", abortSignal: abort.signal });
 
     expect(computeBackoff).toHaveBeenCalled();
     expect(sleepWithAbort).toHaveBeenCalled();
     expect(runSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("restarts when polling exits without error", async () => {
+    const abort = new AbortController();
+    const warn = vi.fn();
+    runSpy
+      .mockImplementationOnce(() => ({
+        task: () => Promise.resolve(),
+        stop: vi.fn(),
+      }))
+      .mockImplementationOnce(() => ({
+        task: () =>
+          Promise.resolve().then(() => {
+            abort.abort();
+          }),
+        stop: vi.fn(),
+      }));
+
+    await monitorTelegramProvider({
+      token: "tok",
+      abortSignal: abort.signal,
+      runtime: { warn } as unknown as Parameters<typeof monitorTelegramProvider>[0]["runtime"],
+    });
+
+    expect(runSpy).toHaveBeenCalledTimes(2);
+    expect(computeBackoff).toHaveBeenCalled();
+    expect(sleepWithAbort).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("polling stopped without error"));
   });
 
   it("surfaces non-recoverable errors", async () => {
